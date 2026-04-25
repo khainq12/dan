@@ -25,7 +25,7 @@ if uploaded:
 
     # ===== INPUT =====
     with col1:
-        st.image(image_path, caption="Input", width='stretch')  # 🔥 fix warning
+        st.image(image_path, caption="Input", use_container_width=True)
 
     # ===== RUN MODEL =====
     res = agent.handle("predict", image_path)
@@ -39,7 +39,7 @@ if uploaded:
         heatmap = cv2.applyColorMap((cam*255).astype("uint8"), cv2.COLORMAP_JET)
         overlay = cv2.addWeighted(img, 0.6, heatmap, 0.4, 0)
 
-        st.image(overlay, caption="Grad-CAM", width='stretch')
+        st.image(overlay, caption="Grad-CAM", use_container_width=True)
 
     st.write(f"Confidence: {res['raw']['confidence']:.2f}")
     st.write(f"Risk: {res['raw']['risk']}")
@@ -65,6 +65,6 @@ if uploaded:
 
             for i in range(min(5, len(paths))):  # 🔥 tránh overflow
                 with cols[i]:
-                    st.image(paths[i], width='stretch')
+                    st.image(paths[i], use_container_width=True)
                     if i < len(labels):
                         st.caption(labels[i])

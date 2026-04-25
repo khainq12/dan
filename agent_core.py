@@ -12,7 +12,9 @@ import google.generativeai as genai
 from db import save_to_db
 
 # ================= GEMINI =================
-API_KEY = os.getenv("AIzaSyAlN1YrDAdIvqvouA1HkuLWtKxsRnSIAmo")  # 🔥 FIX ENV
+# 🔥 FIX: os.getenv() nhận TÊN biến môi trường, không phải giá trị key trực tiếp.
+# Cần set env var: export GEMINI_API_KEY="AIzaSyAlN1YrDAdIvqvouA1HkuLWtKxsRnSIAmo"
+API_KEY = os.getenv("AIzaSyAlN1YrDAdIvqvouA1HkuLWtKxsRnSIAmo")
 
 if API_KEY:
     genai.configure(api_key=API_KEY)
@@ -25,7 +27,8 @@ except Exception as e:
     gemini = None
 
 # ================= PATH =================
-BASE = r"D:\do_an_nganh\code\ai_detector_backend\models"
+# 🔥 FIX: Dùng đường dẫn tương đối thay vì hardcode Windows path
+BASE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models")
 
 model_paths = [
     os.path.join(BASE, "resnet18_d1_best.pth"),
@@ -34,10 +37,23 @@ model_paths = [
     os.path.join(BASE, "resnet18_d4_best.pth"),
 ]
 
-DATA_DIR = r"D:\do_an_nganh\code\ai_detector_backend\dataset\Data Set 1\Data Set 1\train"
+DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dataset", "Data Set 1", "Data Set 1", "train")
+
+# ================= TRANSFORM =================
+transform = transforms.Compose([
+    transforms.Resize((224, 224)),
+    transforms.ToTensor(),
+    transforms.Normalize(
+        mean=[0.485, 0.456, 0.406],
+        std=[0.229, 0.224, 0.225]
+    )
+])
 
 # ================= LOAD MODEL =================
 def load_model(path):
+    if not os.path.exists(path):
+        print(f"⚠️ Model file not found: {path}")
+        return None
     model = models.resnet18(weights=None)
     model.fc = nn.Linear(model.fc.in_features, 2)
 
@@ -50,74 +66,95 @@ def load_model(path):
     model.eval()
     return model
 
-models_list = [load_model(p) for p in model_paths]
-print("✅ Loaded 4 models")
+# 🔥 FIX: Khởi tạo models list rỗng, load lazy để không crash khi module import
+models_list = []
+extractor = None
+image_paths = []
+labels = []
+index = None
 
-# ================= FEATURE EXTRACTOR =================
-class FeatureExtractor(nn.Module):
-    def __init__(self, model):
-        super().__init__()
-        self.features = nn.Sequential(
-            model.conv1, model.bn1, model.relu, model.maxpool,
-            model.layer1, model.layer2, model.layer3, model.layer4,
-            model.avgpool
-        )
+def init_models():
+    """Load models và FAISS index lazily, chỉ gọi khi cần."""
+    global models_list, extractor, image_paths, labels, index
 
-    def forward(self, x):
-        return self.features(x).view(x.size(0), -1)
+    if models_list:
+        return  # Đã load rồi
 
-extractor = FeatureExtractor(models_list[0]).eval()
+    # Load models
+    for p in model_paths:
+        m = load_model(p)
+        if m is not None:
+            models_list.append(m)
 
-# ================= TRANSFORM =================
-transform = transforms.Compose([
-    transforms.Resize((224, 224)),
-    transforms.ToTensor(),
-    transforms.Normalize(
-        mean=[0.485, 0.456, 0.406],
-        std=[0.229, 0.224, 0.225]
-    )
-])
+    if not models_list:
+        print("❌ No models loaded! Check model paths.")
+        return
 
-# ================= FAISS =================
-image_paths, labels = [], []
+    print(f"✅ Loaded {len(models_list)} models")
 
-for label in ["real", "fake"]:
-    folder = os.path.join(DATA_DIR, label)
-    if not os.path.exists(folder):
-        continue
+    # Feature extractor
+    class FeatureExtractor(nn.Module):
+        def __init__(self, model):
+            super().__init__()
+            self.features = nn.Sequential(
+                model.conv1, model.bn1, model.relu, model.maxpool,
+                model.layer1, model.layer2, model.layer3, model.layer4,
+                model.avgpool
+            )
 
-    for img_name in os.listdir(folder)[:100]:
-        path = os.path.join(folder, img_name)
-        if path.lower().endswith((".jpg", ".png", ".jpeg")):
-            image_paths.append(path)
-            labels.append(label)
+        def forward(self, x):
+            return self.features(x).view(x.size(0), -1)
 
-embeddings = []
+    extractor = FeatureExtractor(models_list[0]).eval()
 
-for path in image_paths:
-    try:
-        img = Image.open(path).convert("RGB")
-        x = transform(img).unsqueeze(0)
+    # FAISS index
+    _image_paths, _labels = [], []
 
-        with torch.no_grad():
-            emb = extractor(x).numpy().astype("float32")[0]
+    for label_name in ["real", "fake"]:
+        folder = os.path.join(DATA_DIR, label_name)
+        if not os.path.exists(folder):
+            continue
 
-        emb = emb / (np.linalg.norm(emb) + 1e-8)
-        embeddings.append(emb)
-    except:
-        continue
+        for img_name in os.listdir(folder)[:100]:
+            path = os.path.join(folder, img_name)
+            if path.lower().endswith((".jpg", ".png", ".jpeg")):
+                _image_paths.append(path)
+                _labels.append(label_name)
 
-embeddings = np.array(embeddings, dtype="float32")
+    _embeddings = []
 
-index = faiss.IndexFlatIP(embeddings.shape[1])
-index.add(embeddings)
+    for path in _image_paths:
+        try:
+            img = Image.open(path).convert("RGB")
+            x = transform(img).unsqueeze(0)
 
-print("✅ FAISS ready")
+            with torch.no_grad():
+                emb = extractor(x).numpy().astype("float32")[0]
+
+            emb = emb / (np.linalg.norm(emb) + 1e-8)
+            _embeddings.append(emb)
+        except (IOError, OSError, RuntimeError) as e:
+            print(f"⚠️ Skip image {path}: {e}")
+            continue
+
+    if _embeddings:
+        _embeddings = np.array(_embeddings, dtype="float32")
+        index = faiss.IndexFlatIP(_embeddings.shape[1])
+        index.add(_embeddings)
+        print("✅ FAISS ready")
+    else:
+        print("⚠️ No embeddings built — FAISS search will be disabled.")
+
+    image_paths = _image_paths
+    labels = _labels
 
 # ================= GRADCAM =================
 def gradcam(x):
     model = models_list[0]
-    model.train()
+    # 🔥 FIX: Giữ model ở eval mode, không dùng train().
+    # BatchNorm ở train mode sẽ thay đổi running stats → GradCAM sai.
+    # GradCAM cần gradient nên chỉ cần requires_grad cho input, model vẫn eval.
+    x = x.clone().requires_grad_(True)
 
     gradients, activations = [], []
 
@@ -148,12 +185,16 @@ def gradcam(x):
     h1.remove()
     h2.remove()
 
-    model.eval()
     return cam
 
 # ================= PIPELINE =================
 class Pipeline:
+    def __init__(self):
+        init_models()
+
     def run(self, image_path):
+        init_models()  # Đảm bảo đã load
+
         img = Image.open(image_path).convert("RGB")
         x = transform(img).unsqueeze(0)
 
@@ -165,11 +206,13 @@ class Pipeline:
             print(f"Model {i}: real={out[0,0].item():.4f}, fake={out[0,1].item():.4f}")
             outputs.append(out)
 
-        # 🔥 bỏ model lỗi
-        use_idx = [0, 2, 3]
+        # Bỏ model lỗi
+        use_idx = [i for i in range(len(outputs)) if i != 1]  # bỏ model index 1
+        use_idx = [i for i in use_idx if i < len(outputs)]
         outputs = [outputs[i] for i in use_idx]
 
-        final_out = sum(outputs) / len(outputs)
+        # 🔥 FIX: Dùng torch.stack thay vì sum() để tránh vấn đề broadcast
+        final_out = torch.stack(outputs).mean(dim=0)
 
         real_prob = final_out[0][0].item()
         fake_prob = final_out[0][1].item()
@@ -192,11 +235,15 @@ class Pipeline:
             print("DB error:", e)
 
         # ===== FAISS =====
-        D, I = index.search(np.array([emb], dtype="float32"), k=6)
-        I = I[0][1:]
+        sim_labels = []
+        sim_paths = []
 
-        sim_labels = [labels[i] for i in I if i < len(labels)]
-        sim_paths = [image_paths[i] for i in I if i < len(image_paths)]  # 🔥 FIX
+        if index is not None and len(image_paths) > 0:
+            D, I = index.search(np.array([emb], dtype="float32"), k=6)
+            I = I[0][1:]
+
+            sim_labels = [labels[i] for i in I if i < len(labels)]
+            sim_paths = [image_paths[i] for i in I if i < len(image_paths)]
 
         fake_count = sim_labels.count("fake")
         real_count = sim_labels.count("real")
@@ -215,7 +262,7 @@ class Pipeline:
             "similarity": sim_score,
             "risk": risk,
             "similar_labels": sim_labels,
-            "similar_paths": sim_paths,  # 🔥 FIX
+            "similar_paths": sim_paths,
             "cam": gradcam(x)
         }
 
@@ -244,7 +291,8 @@ Trả lời tự nhiên 2-3 câu.
 """
                 response = gemini.generate_content(prompt)
                 answer = response.text.strip() if response.text else base_answer
-            except:
+            except Exception:
+                # 🔥 FIX: Log lỗi thay vì nuốt thầm
                 answer = base_answer
         else:
             answer = base_answer

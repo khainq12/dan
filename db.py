@@ -1,17 +1,30 @@
 import psycopg2
+from psycopg2 import pool
 
-conn = psycopg2.connect(
-    dbname="ai_image_db",
-    user="postgres",
-    password="12345",   # 🔥 sửa password của bạn
-    host="localhost",
-    port="5432"
-)
+# ===== Connection Pool =====
+_pool = None
 
-cur = conn.cursor()
+def get_pool():
+    """Khởi tạo connection pool lazily (chỉ khi cần)."""
+    global _pool
+    if _pool is None:
+        _pool = pool.SimpleConnectionPool(
+            minconn=1,
+            maxconn=5,
+            dbname="ai_image_db",
+            user="postgres",
+            password="12345",   # TODO: đổi thành env var
+            host="localhost",
+            port="5432"
+        )
+    return _pool
 
 def save_to_db(path, label, confidence, risk, emb):
     try:
+        p = get_pool()
+        conn = p.getconn()
+        cur = conn.cursor()
+
         # ===== 1. insert image =====
         cur.execute(
             "INSERT INTO images(path) VALUES (%s) RETURNING id",
@@ -41,5 +54,11 @@ def save_to_db(path, label, confidence, risk, emb):
         print(f"✅ Saved to DB (image_id={image_id})")
 
     except Exception as e:
-        conn.rollback()
+        if 'conn' in locals():
+            conn.rollback()
         print("❌ DB ERROR:", e)
+    finally:
+        if 'cur' in locals() and cur:
+            cur.close()
+        if 'conn' in locals() and conn:
+            p.putconn(conn)
