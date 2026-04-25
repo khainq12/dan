@@ -1,0 +1,8 @@
+dataset/
+*.jpg
+*.png
+*.jpeg
+*.db
+venv/
+__pycache__/
+tmp*
