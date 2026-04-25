@@ -7,27 +7,67 @@ import faiss
 import cv2
 from torchvision import models, transforms
 from PIL import Image
-import google.generativeai as genai
+
+# ================= GEMINI =================
+# Tự động dùng package mới (google-genai) hoặc cũ (google-generativeai)
+_gemini_mode = None  # "new" hoặc "old"
+_gemini_client = None  # genai.Client (new) hoặc GenerativeModel (old)
+
+import time
+
+API_KEY = os.getenv("GEMINI_API_KEY", "AIzaSyAlN1YrDAdIvqvouA1HkuLWtKxsRnSIAmo")
+GEMINI_MODEL = "gemini-2.0-flash"  # free quota cao hơn gemini-2.5-flash
+
+try:
+    from google import genai as _genai_new
+    if API_KEY:
+        _gemini_client = _genai_new.Client(api_key=API_KEY)
+        _gemini_mode = "new"
+    print("✅ Gemini loaded (google-genai)")
+except ImportError:
+    try:
+        import google.generativeai as _genai_old
+        if API_KEY:
+            _genai_old.configure(api_key=API_KEY)
+            _gemini_client = _genai_old.GenerativeModel(GEMINI_MODEL)
+            _gemini_mode = "old"
+        print("✅ Gemini loaded (google-generativeai, fallback)")
+    except ImportError:
+        print("⚠️ No Gemini package found. Chat will use fallback answers.")
+
+
+def _call_gemini(prompt, max_retries=3):
+    """Gọi Gemini với retry khi bị rate limit (429)."""
+    if not _gemini_mode or not _gemini_client:
+        return None
+
+    for attempt in range(max_retries):
+        try:
+            if _gemini_mode == "new":
+                response = _gemini_client.models.generate_content(
+                    model=GEMINI_MODEL,
+                    contents=prompt
+                )
+                return response.text.strip() if response.text else None
+            elif _gemini_mode == "old":
+                response = _gemini_client.generate_content(prompt)
+                return response.text.strip() if response.text else None
+        except Exception as e:
+            err_msg = str(e)
+            if "429" in err_msg and attempt < max_retries - 1:
+                wait = 10 * (attempt + 1)
+                print(f"⚠️ Gemini rate limited, retry sau {wait}s... ({attempt+1}/{max_retries})")
+                time.sleep(wait)
+                continue
+            else:
+                print(f"⚠️ Gemini error: {err_msg[:120]}")
+                return None
+    return None
+
 
 from db import save_to_db
 
-# ================= GEMINI =================
-# 🔥 FIX: os.getenv() nhận TÊN biến môi trường, không phải giá trị key trực tiếp.
-# Cần set env var: export GEMINI_API_KEY="AIzaSyAlN1YrDAdIvqvouA1HkuLWtKxsRnSIAmo"
-API_KEY = os.getenv("AIzaSyAlN1YrDAdIvqvouA1HkuLWtKxsRnSIAmo")
-
-if API_KEY:
-    genai.configure(api_key=API_KEY)
-
-try:
-    gemini = genai.GenerativeModel("gemini-2.5-flash") if API_KEY else None
-    print("✅ Gemini loaded!")
-except Exception as e:
-    print("❌ Gemini init error:", e)
-    gemini = None
-
 # ================= PATH =================
-# 🔥 FIX: Dùng đường dẫn tương đối thay vì hardcode Windows path
 BASE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models")
 
 model_paths = [
@@ -36,6 +76,8 @@ model_paths = [
     os.path.join(BASE, "resnet18_d3_best.pth"),
     os.path.join(BASE, "resnet18_d4_best.pth"),
 ]
+
+GATE_PATH = os.path.join(BASE, "gated_ensemble_d2.pth")
 
 DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dataset", "Data Set 1", "Data Set 1", "train")
 
@@ -66,21 +108,38 @@ def load_model(path):
     model.eval()
     return model
 
-# 🔥 FIX: Khởi tạo models list rỗng, load lazy để không crash khi module import
+# ================= GATING NETWORK =================
+class GatingNet(nn.Module):
+    """Cùng kiến trúc với lúc train trên Kaggle."""
+    def __init__(self, num_models):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(2 * num_models, 32),
+            nn.ReLU(),
+            nn.Linear(32, num_models),
+            nn.Softmax(dim=1)
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
+# ================= LAZY INIT =================
 models_list = []
 extractor = None
 image_paths = []
 labels = []
 index = None
+gate = None
+EPS = 1e-8
 
 def init_models():
-    """Load models và FAISS index lazily, chỉ gọi khi cần."""
-    global models_list, extractor, image_paths, labels, index
+    """Load models, gate, và FAISS index lazily, chỉ gọi khi cần."""
+    global models_list, extractor, image_paths, labels, index, gate
 
     if models_list:
-        return  # Đã load rồi
+        return
 
-    # Load models
+    # ----- Load base models -----
     for p in model_paths:
         m = load_model(p)
         if m is not None:
@@ -90,9 +149,19 @@ def init_models():
         print("❌ No models loaded! Check model paths.")
         return
 
-    print(f"✅ Loaded {len(models_list)} models")
+    print(f"✅ Loaded {len(models_list)} base models")
 
-    # Feature extractor
+    # ----- Load gating network -----
+    if os.path.exists(GATE_PATH):
+        checkpoint = torch.load(GATE_PATH, map_location="cpu")
+        gate = GatingNet(len(models_list))
+        gate.load_state_dict(checkpoint["gate_state_dict"])
+        gate.eval()
+        print("✅ Gating network loaded")
+    else:
+        print(f"⚠️ Gate file not found: {GATE_PATH} — will use simple average")
+
+    # ----- Feature extractor -----
     class FeatureExtractor(nn.Module):
         def __init__(self, model):
             super().__init__()
@@ -107,10 +176,10 @@ def init_models():
 
     extractor = FeatureExtractor(models_list[0]).eval()
 
-    # FAISS index
+    # ----- FAISS -----
     _image_paths, _labels = [], []
 
-    for label_name in ["real", "fake"]:
+    for label_name in ["fake", "real"]:
         folder = os.path.join(DATA_DIR, label_name)
         if not os.path.exists(folder):
             continue
@@ -131,7 +200,7 @@ def init_models():
             with torch.no_grad():
                 emb = extractor(x).numpy().astype("float32")[0]
 
-            emb = emb / (np.linalg.norm(emb) + 1e-8)
+            emb = emb / (np.linalg.norm(emb) + EPS)
             _embeddings.append(emb)
         except (IOError, OSError, RuntimeError) as e:
             print(f"⚠️ Skip image {path}: {e}")
@@ -143,7 +212,7 @@ def init_models():
         index.add(_embeddings)
         print("✅ FAISS ready")
     else:
-        print("⚠️ No embeddings built — FAISS search will be disabled.")
+        print("⚠️ No embeddings built — FAISS search disabled.")
 
     image_paths = _image_paths
     labels = _labels
@@ -151,9 +220,6 @@ def init_models():
 # ================= GRADCAM =================
 def gradcam(x):
     model = models_list[0]
-    # 🔥 FIX: Giữ model ở eval mode, không dùng train().
-    # BatchNorm ở train mode sẽ thay đổi running stats → GradCAM sai.
-    # GradCAM cần gradient nên chỉ cần requires_grad cho input, model vẫn eval.
     x = x.clone().requires_grad_(True)
 
     gradients, activations = [], []
@@ -178,7 +244,7 @@ def gradcam(x):
     cam = torch.sum(w * a, dim=1).squeeze()
 
     cam = F.relu(cam)
-    cam = cam / (cam.max() + 1e-8)
+    cam = cam / (cam.max() + EPS)
 
     cam = cv2.resize(cam.detach().numpy(), (224, 224))
 
@@ -192,47 +258,71 @@ class Pipeline:
     def __init__(self):
         init_models()
 
-    def run(self, image_path):
-        init_models()  # Đảm bảo đã load
+    def run(self, image_path, skip_db=False, image_bytes=None, filename=None):
+        """Chạy full pipeline. skip_db=True khi không cần lưu DB (chat reuse)."""
+        init_models()
 
         img = Image.open(image_path).convert("RGB")
         x = transform(img).unsqueeze(0)
 
-        outputs = []
+        # ===== ENSEMBLE =====
         print("\n===== MODEL DEBUG =====")
+        gate_weights = None
 
-        for i, m in enumerate(models_list):
-            out = torch.softmax(m(x), dim=1)
-            print(f"Model {i}: real={out[0,0].item():.4f}, fake={out[0,1].item():.4f}")
-            outputs.append(out)
+        with torch.no_grad():
+            probs = [torch.softmax(m(x), dim=1) for m in models_list]
 
-        # Bỏ model lỗi
-        use_idx = [i for i in range(len(outputs)) if i != 1]  # bỏ model index 1
-        use_idx = [i for i in use_idx if i < len(outputs)]
-        outputs = [outputs[i] for i in use_idx]
+            for i, p in enumerate(probs):
+                print(f"Model {i}: fake={p[0,0].item():.4f}, real={p[0,1].item():.4f}")
 
-        # 🔥 FIX: Dùng torch.stack thay vì sum() để tránh vấn đề broadcast
-        final_out = torch.stack(outputs).mean(dim=0)
+            # ----- Gated ensemble (cùng logic với lúc train) -----
+            if gate is not None:
+                concat_probs = torch.cat(probs, dim=1)
+                weights = gate(concat_probs)
 
-        real_prob = final_out[0][0].item()
-        fake_prob = final_out[0][1].item()
+                stacked_probs = torch.stack(probs, dim=1)
+                final_out = (weights.unsqueeze(2) * stacked_probs).sum(dim=1)
+
+                gate_weights = weights[0].tolist()
+                print(f"Gate weights: {[f'{w:.3f}' for w in gate_weights]}")
+            else:
+                # Fallback: simple average (không có gate)
+                final_out = torch.stack(probs).mean(dim=0)
+
+        # ===== LABEL MAPPING =====
+        # ImageFolder sắp xếp alphabet: fake=0, real=1
+        # (Giống với lúc train gate trên Kaggle)
+        fake_prob = final_out[0][0].item()
+        real_prob = final_out[0][1].item()
 
         label = "fake" if fake_prob > real_prob else "real"
-        conf = max(real_prob, fake_prob)
+        conf = max(fake_prob, real_prob)
 
-        print("Final:", label, conf)
+        print(f"Final: {label} ({conf:.4f})")
 
         # ===== EMB =====
         with torch.no_grad():
             emb = extractor(x).numpy().astype("float32")[0]
 
-        emb = emb / (np.linalg.norm(emb) + 1e-8)
+        emb = emb / (np.linalg.norm(emb) + EPS)
+
+        # ===== RISK =====
+        if label == "fake":
+            if conf > 0.85:
+                risk = "HIGH"
+            elif conf > 0.7:
+                risk = "MEDIUM"
+            else:
+                risk = "LOW"
+        else:
+            risk = "SAFE"
 
         # ===== SAVE DB =====
-        try:
-            save_to_db(image_path, label, conf, "HIGH", emb)
-        except Exception as e:
-            print("DB error:", e)
+        if not skip_db:
+            try:
+                save_to_db(image_path, label, conf, risk, emb, image_bytes, filename)
+            except Exception as e:
+                print("DB error:", e)
 
         # ===== FAISS =====
         sim_labels = []
@@ -248,13 +338,7 @@ class Pipeline:
         fake_count = sim_labels.count("fake")
         real_count = sim_labels.count("real")
 
-        sim_score = fake_count / (fake_count + real_count + 1e-6)
-
-        risk = (
-            "HIGH" if conf > 0.75
-            else "MEDIUM" if conf > 0.5
-            else "LOW"
-        )
+        sim_score = fake_count / (fake_count + real_count + EPS)
 
         return {
             "label": label,
@@ -266,20 +350,30 @@ class Pipeline:
             "cam": gradcam(x)
         }
 
+    def get_embedding(self, image_path):
+        """Trích xuất embedding vector từ ảnh (cho similar search)."""
+        init_models()
+        img = Image.open(image_path).convert("RGB")
+        x = transform(img).unsqueeze(0)
+        with torch.no_grad():
+            emb = extractor(x).numpy().astype("float32")[0]
+        return emb / (np.linalg.norm(emb) + EPS)
+
 # ================= AGENT =================
 class ImageAgent:
     def __init__(self, pipeline):
         self.pipeline = pipeline
 
-    def handle(self, query, image_path):
-        r = self.pipeline.run(image_path)
+    def predict(self, image_path, image_bytes=None, filename=None):
+        """Chạy prediction + lưu DB (chỉ gọi 1 lần per ảnh)."""
+        r = self.pipeline.run(image_path, skip_db=False, image_bytes=image_bytes, filename=filename)
+        return {"text": self.build_answer(r), "raw": r}
 
-        base_answer = self.build_answer(r)
+    def chat(self, query, prev_result):
+        """Chat reuse kết quả đã có, KHÔNG chạy lại model, KHÔNG lưu DB."""
+        r = prev_result["raw"]
 
-        if gemini:
-            try:
-                prompt = f"""
-Bạn là AI phát hiện ảnh fake.
+        prompt = f"""Bạn là AI phát hiện ảnh fake.
 
 Label: {r['label']}
 Confidence: {r['confidence']:.2f}
@@ -287,20 +381,33 @@ Risk: {r['risk']}
 
 User: {query}
 
-Trả lời tự nhiên 2-3 câu.
-"""
-                response = gemini.generate_content(prompt)
-                answer = response.text.strip() if response.text else base_answer
-            except Exception:
-                # 🔥 FIX: Log lỗi thay vì nuốt thầm
-                answer = base_answer
-        else:
-            answer = base_answer
+Trả lời tự nhiên 2-3 câu."""
 
-        return {
-            "text": answer,
-            "raw": r
-        }
+        answer = _call_gemini(prompt)
+        if not answer:
+            answer = self.build_answer(r)
+
+        return {"text": answer, "raw": r}
+
+    def handle(self, query, image_path):
+        """Giữ lại cho backward compat — chạy full pipeline."""
+        r = self.pipeline.run(image_path, skip_db=True)
+
+        prompt = f"""Bạn là AI phát hiện ảnh fake.
+
+Label: {r['label']}
+Confidence: {r['confidence']:.2f}
+Risk: {r['risk']}
+
+User: {query}
+
+Trả lời tự nhiên 2-3 câu."""
+
+        answer = _call_gemini(prompt)
+        if not answer:
+            answer = self.build_answer(r)
+
+        return {"text": answer, "raw": r}
 
     def build_answer(self, r):
         label = "giả" if r["label"] == "fake" else "thật"
